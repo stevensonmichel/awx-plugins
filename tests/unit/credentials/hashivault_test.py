@@ -1,6 +1,8 @@
 # pylint: disable=protected-access  # tests access private methods legitimately
 """Tests for HashiCorp Vault credential plugins."""
 
+import base64
+import json
 import typing as _t
 
 # NOTE: The forbidden import here is only used for typing, which warrants
@@ -30,23 +32,139 @@ def test_hashivault_approle_auth() -> None:
 
 
 def test_hashivault_kubernetes_auth(mocker: MockerFixture) -> None:
-    """Test ``kubernetes_auth()`` method returns known JWT."""
+    """Test ``kubernetes_auth()`` scopes the minted token to the Vault URL."""
     kwargs = {
         'kubernetes_role': 'the_kubernetes_role',
+        'url': 'https://vault.example.com',
     }
     expected_res = {
         'role': 'the_kubernetes_role',
         'jwt': 'the_jwt',
     }
-    path_mock = mocker.patch('pathlib.Path')
-    path_mock.return_value.open = mocker.mock_open(read_data='the_jwt')
+    jwt_mock = mocker.patch.object(
+        hashivault,
+        '_request_scoped_jwt',
+        return_value='the_jwt',
+    )
     res = hashivault.kubernetes_auth(  # type: ignore[no-untyped-call]
         **kwargs,
     )
-    path_mock.assert_called_with(
-        '/var/run/secrets/kubernetes.io/serviceaccount/token',
-    )
+    jwt_mock.assert_called_once_with(audience='https://vault.example.com')
     assert res == expected_res
+
+
+@pytest.mark.parametrize(
+    ('sub_claim', 'expected_name'),
+    (
+        pytest.param(
+            'system:serviceaccount:awx:awx-task',
+            'awx-task',
+            id='no-padding-chars-needed',
+        ),
+        pytest.param(
+            'system:serviceaccount:ns:ab',
+            'ab',
+            id='one-padding-char-needed',
+        ),
+        pytest.param(
+            'system:serviceaccount:ns:a',
+            'a',
+            id='two-padding-chars-needed',
+        ),
+    ),
+)
+def test_hashivault_service_account_name(
+    sub_claim: str,
+    expected_name: str,
+) -> None:
+    """Test ``_service_account_name()`` parses the token ``sub`` claim, regardless of how much base64 padding must be restored."""
+    claims = (
+        base64.urlsafe_b64encode(
+            json.dumps({'sub': sub_claim}).encode(),
+        )
+        .rstrip(b'=')
+        .decode()
+    )
+    jwt = f'header.{claims}.signature'
+    name = hashivault._service_account_name(jwt)
+    assert name == expected_name
+
+
+def test_hashivault_request_scoped_jwt(mocker: MockerFixture) -> None:
+    """Test ``_request_scoped_jwt()`` mints an audience-scoped token."""
+    mocker.patch(
+        'pathlib.Path.read_text',
+        side_effect=['the-sa-token', 'awx-ns'],
+    )
+    mocker.patch.object(
+        hashivault,
+        '_service_account_name',
+        return_value='awx-task',
+    )
+    mocker.patch.dict(
+        'os.environ',
+        {
+            'KUBERNETES_SERVICE_HOST': '10.0.0.1',
+            'KUBERNETES_SERVICE_PORT': '443',
+        },
+    )
+    post_mock = mocker.patch('requests.Session.post')
+    post_mock.return_value.status_code = 200
+    post_mock.return_value.json.return_value = {
+        'status': {'token': 'minted-jwt'},
+    }
+
+    jwt = hashivault._request_scoped_jwt(
+        audience='https://vault.example.com',
+    )
+
+    assert jwt == 'minted-jwt'
+    post_mock.assert_called_once()
+    call = post_mock.call_args
+    assert call.args[0] == (
+        'https://10.0.0.1:443/api/v1'
+        '/namespaces/awx-ns/serviceaccounts/awx-task/token'
+    )
+    assert call.kwargs['json']['spec'] == {
+        'audiences': ['https://vault.example.com'],
+        'expirationSeconds': 600,
+    }
+    assert call.kwargs['verify'] == (
+        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+    )
+
+
+def test_hashivault_request_scoped_jwt_error_status(  # noqa: WPS118
+    mocker: MockerFixture,
+) -> None:
+    """Test ``_request_scoped_jwt()`` propagates HTTP errors from the TokenRequest API."""
+    mocker.patch(
+        'pathlib.Path.read_text',
+        side_effect=['the-sa-token', 'awx-ns'],
+    )
+    mocker.patch.object(
+        hashivault,
+        '_service_account_name',
+        return_value='awx-task',
+    )
+    mocker.patch.dict(
+        'os.environ',
+        {
+            'KUBERNETES_SERVICE_HOST': '10.0.0.1',
+            'KUBERNETES_SERVICE_PORT': '443',
+        },
+    )
+    post_mock = mocker.patch('requests.Session.post')
+    post_mock.return_value.status_code = 403
+    post_mock.return_value.raise_for_status.side_effect = (
+        hashivault.requests.HTTPError('403 Client Error: Forbidden')
+    )
+
+    with pytest.raises(
+        hashivault.requests.HTTPError,
+        match='403 Client Error',
+    ):
+        hashivault._request_scoped_jwt(audience='https://vault.example.com')
 
 
 def test_hashivault_client_cert_auth_explicit_role() -> None:  # noqa: WPS118
@@ -137,10 +255,14 @@ def test_hashivault_handle_auth_kubernetes(mocker: MockerFixture) -> None:
     """Test ``handle_auth()`` with k8s role and JWT auth returns a token."""
     kwargs = {
         'kubernetes_role': 'the_kubernetes_role',
+        'url': 'https://vault.example.com',
     }
     method_mock = mocker.patch.object(hashivault, 'method_auth')
-    path_mock = mocker.patch('pathlib.Path')
-    path_mock.return_value.open = mocker.mock_open(read_data='the_jwt')
+    mocker.patch.object(
+        hashivault,
+        '_request_scoped_jwt',
+        return_value='the_jwt',
+    )
     method_mock.return_value = 'the_token'
     token = hashivault.handle_auth(  # type: ignore[no-untyped-call]
         **kwargs,

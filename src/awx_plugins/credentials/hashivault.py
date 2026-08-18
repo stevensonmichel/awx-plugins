@@ -1,9 +1,11 @@
 # FIXME: the following violations must be addressed gradually and unignored
 # mypy: disable-error-code="arg-type, no-untyped-call, no-untyped-def"
 
+import base64
 import contextlib as _ctx
 import contextvars as _ctx_vars
 import functools as _functools
+import json
 import os
 import pathlib
 import time
@@ -459,12 +461,74 @@ def approle_auth(**kwargs):
     return {'role_id': kwargs['role_id'], 'secret_id': kwargs['secret_id']}
 
 
-def kubernetes_auth(**kwargs):
-    jwt_file = pathlib.Path(
-        '/var/run/secrets/kubernetes.io/serviceaccount/token',
+_SERVICE_ACCOUNT_DIR = '/var/run/secrets/kubernetes.io/serviceaccount'
+"""In-pod mount point for the default ServiceAccount credentials."""
+
+_TOKEN_REQUEST_TTL_SECONDS = 600
+"""Lifetime of the minted token; 600s is the Kubernetes TokenRequest floor."""
+
+
+def _service_account_name(jwt: str) -> str:
+    """Recover this pod's ServiceAccount name from its own token.
+
+    The ``sub`` claim of a Kubernetes ServiceAccount token has the form
+    ``system:serviceaccount:<namespace>:<name>``. The token is our own, so the
+    claims are read without signature verification purely to learn the name.
+    """
+    claims_segment = jwt.split('.')[1]
+    padding = '=' * (-len(claims_segment) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(claims_segment + padding))
+    return str(claims['sub']).rsplit(':', maxsplit=1)[-1]
+
+
+def _request_scoped_jwt(*, audience: str) -> str:
+    """Mint a fresh, audience-scoped token for the pod's ServiceAccount.
+
+    Uses the Kubernetes TokenRequest API instead of reading and forwarding the
+    broad, apiserver-audience default ServiceAccount token. The minted token is
+    short-lived and scoped to ``audience`` (the Vault server URL), so a token
+    captured by a malicious endpoint cannot be replayed against the Kubernetes
+    API or a Vault server at a different URL.
+    """
+    sa_dir = pathlib.Path(_SERVICE_ACCOUNT_DIR)
+    sa_token = (sa_dir / 'token').read_text().rstrip()
+    namespace = (sa_dir / 'namespace').read_text().rstrip()
+    sa_name = _service_account_name(sa_token)
+
+    api_host = os.environ['KUBERNETES_SERVICE_HOST']
+    api_port = os.environ.get('KUBERNETES_SERVICE_PORT', '443')
+    request_url = (
+        f'https://{api_host}:{api_port}/api/v1'
+        f'/namespaces/{namespace}/serviceaccounts/{sa_name}/token'
     )
-    with jwt_file.open('r') as jwt_fo:
-        jwt = jwt_fo.read().rstrip()
+    token_request = {
+        'apiVersion': 'authentication.k8s.io/v1',
+        'kind': 'TokenRequest',
+        'spec': {
+            'audiences': [audience],
+            'expirationSeconds': _TOKEN_REQUEST_TTL_SECONDS,
+        },
+    }
+
+    sess = requests.Session()
+    sess.headers['Authorization'] = f'Bearer {sa_token}'
+    resp = sess.post(
+        request_url,
+        json=token_request,
+        verify=str(sa_dir / 'ca.crt'),
+        timeout=30,
+    )
+    raise_for_status(resp)
+    return str(resp.json()['status']['token'])
+
+
+def kubernetes_auth(**kwargs):
+    # Mint a fresh ServiceAccount token scoped to this Vault's URL via the
+    # Kubernetes TokenRequest API, rather than forwarding the pod's broad
+    # default token. Binding the audience to the destination URL means a token
+    # captured by a malicious Vault endpoint is useless elsewhere: neither the
+    # Kubernetes API nor a Vault at a different URL will accept it.
+    jwt = _request_scoped_jwt(audience=kwargs['url'])
     return {'role': kwargs['kubernetes_role'], 'jwt': jwt}
 
 
@@ -653,26 +717,26 @@ def kv_backend(  # noqa: WPS211 -- the same as too-many-arguments
                 break
     raise_for_status(response)
 
-    json = response.json()
+    resp_json = response.json()
     if api_version == 'v2':
-        json = json['data']
+        resp_json = resp_json['data']
 
     if secret_key:
         try:
             if (
                 (secret_key != 'data')
                 and (  # noqa: S105; not a password
-                    secret_key not in json['data']
+                    secret_key not in resp_json['data']
                 )
-                and ('data' in json['data'])
+                and ('data' in resp_json['data'])
             ):
-                return str(json['data']['data'][secret_key])
-            return str(json['data'][secret_key])
+                return str(resp_json['data']['data'][secret_key])
+            return str(resp_json['data'][secret_key])
         except KeyError:
             raise RuntimeError(
                 f'{secret_key} is not present at {secret_path}',
             )
-    return str(json['data'])
+    return str(resp_json['data'])
 
 
 @_inject_auth_token_with_revocation
